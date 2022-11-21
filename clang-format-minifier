@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import subprocess
+import sys
+
+try:
+    import yaml
+except ImportError:
+    print("Please install PyYAML")
+    exit(1)
+
+
+def get_config_values(clang_format_binary, config, file=None):
+    try:
+        # for file configs, we need to switch cwd; older clang-format's don't support
+        # -style=file:<format_file_path>
+        result = subprocess.check_output(
+            [clang_format_binary, "--style", config, "--dump-config"],
+            cwd=os.path.dirname(file) if file else None,
+        )
+        data = yaml.load(result.decode("UTF-8"), Loader=yaml.SafeLoader)
+        # convert all value types to string, so we can later compare them with
+        # set(). leads to less-than-optimal minifying!
+        data = {k: str(v) for k, v in data.items()}
+        return data
+    except subprocess.CalledProcessError:
+        print("Unsupported preset: {}".format(config), file=sys.stderr)
+
+
+def main():
+    "cli entrance point"
+    argparser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="Minify a clang-format file and output result to stdout",
+    )
+
+    argparser.add_argument(
+        "--clang-format-binary",
+        default="clang-format",
+        help="Path or name of clang-format tool to use",
+    )
+
+    argparser.add_argument(
+        "clang_format_file",
+        help="The .clang-format file to minify",
+    )
+
+    args = argparser.parse_args()
+
+    assert os.path.isfile(args.clang_format_file), "File not found: {}".format(
+        args.clang_format_file
+    )
+
+    # get all supported preset configs
+    base_configs = {}
+    base_config_names = ("LLVM", "GNU", "Google", "Chromium", "Microsoft", "Mozilla", "WebKit")
+    for base_config in base_config_names:
+        data = get_config_values(args.clang_format_binary, base_config)
+        if data:
+            base_configs[base_config] = data
+    print("Checking against these presets: {}".format(base_configs.keys()), file=sys.stderr)
+
+    file_config = get_config_values(args.clang_format_binary, "file", args.clang_format_file)
+
+    # compute differences from preset configs
+    diffs = {}
+    for base_config_name, base_config in base_configs.items():
+        # from https://stackoverflow.com/a/41808831 , the order is important. we
+        # want only the key+value pairs that are different from the base config
+        diff = set(base_config.items()) - set(file_config.items())
+        diffs[base_config_name] = sorted(dict(diff))
+
+    selected_base_config = min(diffs, key=lambda k: len(diffs[k]))
+    print(
+        "Smallest diff:",
+        selected_base_config,
+        "with:",
+        len(diffs[selected_base_config]),
+        "differences",
+        file=sys.stderr,
+    )
+
+    # now get the non-stringified config values that differ from the base config
+    diff_config_values = {k: file_config[k] for k in diffs[selected_base_config]}
+
+    # now output the minified config
+    output_template = """---
+BasedOnStyle: {base_config}
+---
+Language: Cpp
+
+{diff_config_values}
+..."""
+    print(
+        output_template.format(
+            base_config=selected_base_config,
+            diff_config_values=yaml.dump(diff_config_values, default_flow_style=False),
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
